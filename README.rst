@@ -2,6 +2,7 @@ ssh-pkcs11-ca
 =============
 
 A tiny ssh CA whose CA key is on a PKCS #11 token
+-------------------------------------------------
 
 ::
 
@@ -30,3 +31,24 @@ when signing, take the same arguments as ssh-keygen does (except we take a singl
 
 
 No configuration required, just run the script with a token plugged in.
+
+Why would you use this?
+-----------------------
+
+If you keep your ssh keys on a token, and don't forward the agent connection, you can connect fine to Server A, or to Server B. But what happens when you want to connect from Server A *to* Server B?
+
+::
+
+               +----------+
+          +--->| Server A |--+
+          |    +----------+  |
+  +--------+                 |
+  | Laptop |                ???
+  +--------+                 |
+          |    +----------+  |
+          +--->| Server B |<-+
+               +----------+
+
+You could create a keypair on Server A and add the pubkey to Server B, and then remember to remove the pubkey when you're done. Or just use this tool to create a certificate with 5-minute validity.
+
+This is only useful for personal stuff where the individual token holder is the ultimate trust root. If you want ssh certificates for more than one person, this isn't the CA for you.
