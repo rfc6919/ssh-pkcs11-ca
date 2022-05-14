@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import tempfile
+import argparse
+import subprocess
+import glob
+
+# authorized_keys:
+# "cert-authority,restrict,pty $(ssh-keygen -D /usr/lib/ssh-keychain.dylib -e)"
+#
+# known_hosts:
+# "@cert-authority * $(ssh-keygen -D /usr/lib/ssh-keychain.dylib -e)"
+#
+# sign
+# ssh-keygen -s ca.pub -D /usr/lib/ssh-keychain.dylib -I ${key_identity} user.pub
+# outputs to user-cert.pub
+
+pkcs11_lib_paths = [
+    '/usr/lib/ssh-keychain.dylib',  # macOS
+    '/usr/lib/*/libykcs11.so',      # yubikey
+    '/usr/lib/*/opensc-pkcs11.so',  # opensc
+]
+
+class Token:
+    def __init__(self, pkcs11_lib_path):
+        self.pkcs11_lib_path = pkcs11_lib_path
+        try:
+            self.id = b'yubikey-' + subprocess.run(['ykinfo','-qs'], stdout=subprocess.PIPE, check=True).stdout.rstrip()
+        except FileNotFoundError:
+            self.id = b'token'
+        self.pubkey_components = self.run_cmd(['-e']).split(b' ')
+        self.pubkey_components[2] = self.id
+
+    def run_cmd(self, args):
+        cmd = ['ssh-keygen', '-D', self.pkcs11_lib_path]
+        cmd.extend(args)
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, check=True).stdout.rstrip()
+        return result
+
+    def token_pubkey(self):
+        return ' '.join([component.decode(encoding='ascii') for component in self.pubkey_components])
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    #parser.add_argument('-D', metavar='pkcs11_library', help='path to the PKCS#11 library, if not autodetected')
+    sub_parsers = parser.add_subparsers(dest='action', required=True)
+    parser_authorized_keys = sub_parsers.add_parser('authorized_keys',
+        help='print a suitable authorized_keys line for the current token')
+    parser_known_hosts = sub_parsers.add_parser('known_hosts',
+        help='print a suitable known_hosts line for the current token')
+    parser_sign = sub_parsers.add_parser('sign',
+        help='produce a certificate on stdout for the public key provided on stdin')
+    parser_sign.add_argument('-I', metavar='cert_identity', help='identity logged by server on use of this certificate (default "%(default)s")', default=os.environ.get('USER'))
+    parser_sign.add_argument('-n', metavar='principals', help='comma separated list of principals to include (default "%(default)s")', default=os.environ.get('USER'))
+    parser_sign.add_argument('-O', metavar='options', help='comma separated list of options to include (default "%(default)s")', default='clear,permit-pty')
+    parser_sign.add_argument('-V', metavar='validity_interval', help='validity interval (default "%(default)s")', default='-1m:+5m')
+    parser_sign.add_argument('-z', metavar='serial_number', help='serial number')
+    args = parser.parse_args()
+
+    found_pkcs11_libs = [path for gp in pkcs11_lib_paths for path in glob.glob(gp)]
+    if len(found_pkcs11_libs) >= 1:
+        pkcs11_lib_path = found_pkcs11_libs[0]
+    else:
+        raise RuntimeError('no PKCS#11 library found')
+    token = Token(pkcs11_lib_path)
+
+    if args.action == 'authorized_keys':
+        print(f'cert-authority,restrict,pty {token.token_pubkey()}')
+    elif args.action == 'known_hosts':
+        print(f'@cert-authority * {token.token_pubkey()}')
+    elif args.action == 'sign':
+        keygen_args = []
+        for argname, argval in [(arg, args.__getattribute__(arg)) for arg in 'InOVz' if arg in dir(args) and args.__getattribute__(arg) is not None]:
+            if argname == 'O':
+                # we take a single -O of comma-separated options, but ssh-keygen takes multiple -O options instead
+                for argitem in argval.split(','):
+                    keygen_args.extend((f'-{argname}', argitem))
+            else:
+                keygen_args.extend((f'-{argname}', argval))
+        with tempfile.TemporaryDirectory() as workdir:
+            os.chdir(workdir)
+            # read token pubkey to f'{workdir}/ca.pub'
+            with open('ca.pub', mode='x') as ca_pubkey_fd:
+                print(token.token_pubkey(), file=ca_pubkey_fd)
+            # read stdin to f'{workdir}/user.pub'
+            with open('user.pub', mode='x') as user_pubkey_fd:
+                print(sys.stdin.read(), file=user_pubkey_fd)
+            print('II: signing pubkey, your token will probably ask for a PIN here', file=sys.stderr)
+            token.run_cmd(keygen_args + ['-s', 'ca.pub', 'user.pub'])
+            # print f'{workdir}/user-cert.pub' to stdout
+            with open('user-cert.pub') as user_cert_fd:
+                print(user_cert_fd.read().rstrip())
